@@ -237,7 +237,12 @@ export default async function handler(req: Request): Promise<Response> {
     model,
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
-    max_tokens: Math.min(clampNum(body.max_tokens, 1, 4096, 900), 1200),
+    // Floor of 1536: Anthropic's extended-thinking minimum budget is 1024
+    // tokens, and thinking tokens count against max_tokens, so anything at or
+    // below that floor 400s outright ("max_tokens must be greater than
+    // thinking.budget_tokens") whenever Manifest's fallback chain lands on a
+    // thinking-enabled Claude model (e.g. gemini-2.5-flash 429s -> claude-haiku-4-5).
+    max_tokens: Math.min(Math.max(clampNum(body.max_tokens, 1, 4096, 900), 1536), 3072),
   };
   const responseFormat = normalizeResponseFormat(body.response_format);
   const upstreamBody = {
