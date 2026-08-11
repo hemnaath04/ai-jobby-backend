@@ -233,7 +233,7 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
-  const baseBody = {
+  const baseBody: Record<string, unknown> = {
     model,
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
@@ -245,7 +245,7 @@ export default async function handler(req: Request): Promise<Response> {
     max_tokens: Math.min(Math.max(clampNum(body.max_tokens, 1, 4096, 900), 1536), 3072),
   };
   const responseFormat = normalizeResponseFormat(body.response_format);
-  const upstreamBody = {
+  const upstreamBody: Record<string, unknown> = {
     ...baseBody,
     ...(responseFormat ? { response_format: responseFormat } : {}),
   };
@@ -257,13 +257,38 @@ export default async function handler(req: Request): Promise<Response> {
       body: JSON.stringify(b),
     });
 
+  // The body we actually sent, so each retry below keeps earlier adjustments.
+  let sent: Record<string, unknown> = upstreamBody;
   let upstream: Response;
   let text: string;
   try {
-    upstream = await call(upstreamBody);
+    upstream = await call(sent);
     text = await upstream.text();
   } catch (e: any) {
     return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
+  }
+
+  // Safety net: Manifest injects Anthropic thinking on the OpenAI-compatible
+  // /chat/completions path (its "strip adaptive thinking for Claude Haiku" fix
+  // only covers native Anthropic Messages requests), and thinking tokens count
+  // against max_tokens. When the route's configured budget is larger than the
+  // 1536 floor above, Anthropic rejects the call pre-model with 0 tokens used.
+  // Retry once with a max_tokens big enough to hold any sane budget. The real
+  // fix is unsetting thinking on that route's Model params in Manifest.
+  const thinkingRetryMaxTokens = clampNum(
+    process.env.THINKING_RETRY_MAX_TOKENS,
+    2048,
+    32_000,
+    16_384,
+  );
+  if (upstream.status >= 400 && text.includes('thinking.budget_tokens')) {
+    sent = { ...sent, max_tokens: thinkingRetryMaxTokens };
+    try {
+      upstream = await call(sent);
+      text = await upstream.text();
+    } catch (e: any) {
+      return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
+    }
   }
 
   // Safety net: if Manifest still exhausts its Anthropic route because a
@@ -283,8 +308,10 @@ export default async function handler(req: Request): Promise<Response> {
   };
 
   if (looksLikeManifestAnthropicSchemaBug()) {
+    const { response_format: _dropped, ...withoutSchema } = sent;
+    sent = withoutSchema;
     try {
-      upstream = await call(baseBody);
+      upstream = await call(sent);
       text = await upstream.text();
     } catch (e: any) {
       return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
