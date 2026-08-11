@@ -268,20 +268,37 @@ export default async function handler(req: Request): Promise<Response> {
     return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
   }
 
+  // Upstream failures are otherwise invisible: the body is passed straight back
+  // to the extension, which shows only the human-readable message. Log the shape
+  // so the gateway's own error payload is diagnosable from `vercel logs`.
+  const logUpstreamFailure = (label: string) => {
+    if (upstream.status < 400) return;
+    console.error(
+      `[upstream ${label}] status=${upstream.status} max_tokens=${sent.max_tokens} body=${text.slice(0, 400)}`,
+    );
+  };
+  logUpstreamFailure('attempt-1');
+
   // Safety net: Manifest injects Anthropic thinking on the OpenAI-compatible
   // /chat/completions path (its "strip adaptive thinking for Claude Haiku" fix
   // only covers native Anthropic Messages requests), and thinking tokens count
   // against max_tokens. When the route's configured budget is larger than the
-  // 1536 floor above, Anthropic rejects the call pre-model with 0 tokens used.
-  // Retry once with a max_tokens big enough to hold any sane budget. The real
-  // fix is unsetting thinking on that route's Model params in Manifest.
+  // 1536 floor above, Anthropic rejects the call pre-model with 0 tokens used,
+  // the whole chain is exhausted, and Manifest reports the PRIMARY's failure —
+  // typically the 429 that triggered the fallback in the first place, with no
+  // mention of budget_tokens. So retry on that 429 too, not just on a body that
+  // names the thinking error. The real fix is unsetting thinking on that route's
+  // Model params in Manifest; this only keeps a rate-limited primary survivable.
   const thinkingRetryMaxTokens = clampNum(
     process.env.THINKING_RETRY_MAX_TOKENS,
     2048,
     32_000,
     16_384,
   );
-  if (upstream.status >= 400 && text.includes('thinking.budget_tokens')) {
+  const worthRetryingWithRoomForThinking =
+    upstream.status === 429 ||
+    (upstream.status >= 400 && text.includes('thinking.budget_tokens'));
+  if (worthRetryingWithRoomForThinking && Number(sent.max_tokens) < thinkingRetryMaxTokens) {
     sent = { ...sent, max_tokens: thinkingRetryMaxTokens };
     try {
       upstream = await call(sent);
@@ -289,6 +306,7 @@ export default async function handler(req: Request): Promise<Response> {
     } catch (e: any) {
       return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
     }
+    logUpstreamFailure('thinking-retry');
   }
 
   // Safety net: if Manifest still exhausts its Anthropic route because a
@@ -316,6 +334,7 @@ export default async function handler(req: Request): Promise<Response> {
     } catch (e: any) {
       return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
     }
+    logUpstreamFailure('schema-retry');
   }
 
   // Pass the OpenAI-shaped response straight through (extension reads choices[0]).
