@@ -244,13 +244,18 @@ async function handler(req: Request): Promise<Response> {
   if (GROQ_KEY) {
     // Groq's classic Llama chat models (llama-3.1-8b-instant,
     // llama-3.3-70b-versatile) were retired from this account's catalog —
-    // verified live against GET /openai/v1/models on 2026-08-22. gpt-oss-20b
-    // is the smallest/fastest chat model currently available.
-    const groqModel = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
+    // verified live against GET /openai/v1/models on 2026-08-22. Of what's
+    // left, qwen/qwen3.6-27b is the only model whose reasoning_effort accepts
+    // "none" (true reasoning off); GPT-OSS only goes as low as "low" and
+    // burned its whole max_tokens budget on hidden reasoning in testing
+    // (json_validate_failed: "max completion tokens reached before
+    // generating a valid document").
+    const groqModel = process.env.GROQ_MODEL || 'qwen/qwen3.6-27b';
+    const groqReasoningEffort = process.env.GROQ_REASONING_EFFORT || 'none';
     leg = await callLeg(
       'https://api.groq.com/openai/v1/chat/completions',
       GROQ_KEY,
-      { ...sharedBody, model: groqModel },
+      { ...sharedBody, model: groqModel, reasoning_effort: groqReasoningEffort },
       Number(process.env.GROQ_TIMEOUT_MS || '10000'),
     );
     if (leg) console.error(`[groq] status=${leg.status} usable=${isUsable(leg)} body=${leg.text.slice(0, 300)}`);
