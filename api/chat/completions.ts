@@ -242,7 +242,11 @@ async function handler(req: Request): Promise<Response> {
   // real answer lands in low single-digit seconds, so anything slower than
   // this is worth failing over rather than waiting on.
   if (GROQ_KEY) {
-    const groqModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+    // Groq's classic Llama chat models (llama-3.1-8b-instant,
+    // llama-3.3-70b-versatile) were retired from this account's catalog —
+    // verified live against GET /openai/v1/models on 2026-08-22. gpt-oss-20b
+    // is the smallest/fastest chat model currently available.
+    const groqModel = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
     leg = await callLeg(
       'https://api.groq.com/openai/v1/chat/completions',
       GROQ_KEY,
