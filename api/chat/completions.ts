@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// RoleReveal backend proxy (Vercel Edge Function).
+// RoleReveal backend proxy (Vercel Node.js Function).
 //
 // Why this exists: a Chrome extension is public JS, so any key shipped in it is
 // extractable. This proxy holds the real LLM key SERVER-SIDE (env var) and the
@@ -8,8 +8,14 @@
 // URL at `https://<this-deployment>/api`.
 //
 // Route: POST /api/chat/completions   (Vercel maps this file to that path)
-// ---------------------------------------------------------------------------
-export const config = { runtime: 'edge' };
+//
+// Runs on the Node.js runtime, not Edge: this handler buffers the full
+// upstream response (and sometimes retries once) before writing anything back,
+// and Edge Functions must begin sending a response within 25 seconds or Vercel
+// kills the invocation with FUNCTION_INVOCATION_TIMEOUT. Slow free reasoning
+// models plus the truncation retry below can easily exceed that. Node.js
+// Functions don't have that "first byte" ceiling — only the maxDuration below.
+export const config = { maxDuration: 60 };
 
 // Vercel provides process.env at runtime; declare it so we don't need @types/node.
 declare const process: { env: Record<string, string | undefined> };
@@ -177,7 +183,7 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
   return { ok: true };
 }
 
-export default async function handler(req: Request): Promise<Response> {
+async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
 
@@ -370,3 +376,8 @@ export default async function handler(req: Request): Promise<Response> {
     headers: { 'content-type': 'application/json', ...CORS },
   });
 }
+
+// Node.js Vercel Function using the documented `fetch` Web Standard export so
+// this one handler covers every HTTP method (OPTIONS/POST/etc — see the
+// method check at the top of handler()) without a classic (req, res) signature.
+export default { fetch: handler };
