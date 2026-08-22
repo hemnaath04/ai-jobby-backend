@@ -2,20 +2,34 @@
 // RoleReveal backend proxy (Vercel Node.js Function).
 //
 // Why this exists: a Chrome extension is public JS, so any key shipped in it is
-// extractable. This proxy holds the real LLM key SERVER-SIDE (env var) and the
+// extractable. This proxy holds the real LLM keys SERVER-SIDE (env vars) and the
 // extension calls this endpoint instead. It's OpenAI-compatible, so the
 // extension's existing "custom" provider works unchanged — just point its base
 // URL at `https://<this-deployment>/api`.
 //
+// Model routing: Groq FIRST — a genuinely non-reasoning, fast provider (500+
+// tok/s on Llama 3.1 8B, 250+ tok/s on Llama 3.3 70B; generous free tier).
+// Falls back to OpenRouter's free model catalog on any Groq failure (missing
+// key, error, rate limit, timeout, empty/truncated response), with reasoning
+// explicitly disabled (`reasoning: { enabled: false }`) — every current
+// OpenRouter free model advertises that toggle. The client's `model` field
+// (the extension always sends "auto") is ignored; the model is always chosen
+// server-side per leg below.
+//
+// Manifest is no longer in this path: it silently overrides/strips
+// per-request reasoning flags (measured: reasoning stayed on even after
+// sending reasoning:{enabled:false} through it) and several of its free
+// fallback models are reasoning models that burn 100+ hidden tokens before
+// writing the visible answer, which is what made scoring slow in the first
+// place.
+//
 // Route: POST /api/chat/completions   (Vercel maps this file to that path)
 //
-// Runs on the Node.js runtime, not Edge: this handler buffers the full
-// upstream response (and sometimes retries once) before writing anything back,
-// and Edge Functions must begin sending a response within 25 seconds or Vercel
-// kills the invocation with FUNCTION_INVOCATION_TIMEOUT. Slow free reasoning
-// models plus the truncation retry below can easily exceed that. Node.js
-// Functions don't have that "first byte" ceiling — only the maxDuration below.
-export const config = { maxDuration: 60 };
+// Runs on the Node.js runtime, not Edge: Edge Functions must begin sending a
+// response within 25 seconds or Vercel kills the invocation, and a
+// primary-then-fallback call can occasionally take longer than that. Node.js
+// Functions only have the maxDuration budget below, no first-byte deadline.
+export const config = { maxDuration: 30 };
 
 // Vercel provides process.env at runtime; declare it so we don't need @types/node.
 declare const process: { env: Record<string, string | undefined> };
@@ -39,73 +53,8 @@ function clampNum(v: unknown, min: number, max: number, dflt: number): number {
   return Math.min(max, Math.max(min, n));
 }
 
-// Manifest translates OpenAI's loose `{ type: 'json_object' }` shorthand to
-// Anthropic native structured output. Anthropic requires every object in that
-// schema to declare `additionalProperties: false`; an unconstrained
-// `{ type: 'object' }` is rejected before the model runs. RoleReveal has one
-// JSON-mode operation, so upgrade that shorthand to its real strict schema at
-// the proxy. This fixes existing extension installs immediately and remains
-// compatible when Manifest routes the same request to Gemini or OpenAI.
-const EVALUATION_RESPONSE_FORMAT = {
-  type: 'json_schema',
-  json_schema: {
-    name: 'rolereveal_evaluation',
-    strict: true,
-    schema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        perResume: {
-          type: 'array',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              label: { type: 'string' },
-              score: { type: 'number' },
-            },
-            required: ['label', 'score'],
-          },
-        },
-        bestResume: { type: 'string' },
-        overallScore: { type: 'number' },
-        verdict: { type: 'string', enum: ['Apply', 'Maybe', 'Skip'] },
-        summary: { type: 'string' },
-        dimensions: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            skills: { type: 'number' },
-            experience: { type: 'number' },
-            roleContext: { type: 'number' },
-          },
-          required: ['skills', 'experience', 'roleContext'],
-        },
-        whyMatch: { type: 'string' },
-        watchOuts: { type: 'string' },
-      },
-      required: [
-        'perResume',
-        'bestResume',
-        'overallScore',
-        'verdict',
-        'summary',
-        'dimensions',
-        'whyMatch',
-        'watchOuts',
-      ],
-    },
-  },
-} as const;
-
-export function normalizeResponseFormat(value: unknown): unknown {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  const type = (value as Record<string, unknown>).type;
-  return type === 'json_object' ? EVALUATION_RESPONSE_FORMAT : value;
-}
-
 // ── Strict, persistent rate limiting via Upstash Redis ──────────────────────
-// Counters survive across edge invocations. Enforced ONLY when Upstash env vars
+// Counters survive across invocations. Enforced ONLY when Upstash env vars
 // are set — set them before going public, or there is no shared counter to
 // enforce against (serverless has no shared memory).
 function redisConfigured(): boolean {
@@ -183,13 +132,62 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
   return { ok: true };
 }
 
+interface LegResult {
+  status: number;
+  text: string;
+}
+
+async function callLeg(
+  url: string,
+  key: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+  extraHeaders: Record<string, string> = {},
+): Promise<LegResult | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...extraHeaders },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    return { status: res.status, text };
+  } catch (e: any) {
+    console.error(`[leg unreachable/timeout] ${String(e?.message || e)}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// A leg is only "usable" if it succeeded AND actually finished writing an
+// answer. A 200 with empty content, or one cut off by finish_reason "length"
+// (a reasoning model spending its whole budget on hidden thinking), isn't
+// something worth returning to the extension — fall through to the next leg
+// instead of surfacing "empty response" / "No JSON object found" errors.
+function isUsable(leg: LegResult | null): boolean {
+  if (!leg || leg.status < 200 || leg.status >= 300) return false;
+  try {
+    const choice = JSON.parse(leg.text)?.choices?.[0];
+    const content = choice?.message?.content;
+    const truncated = choice?.finish_reason === 'length' || choice?.native_finish_reason === 'length';
+    const hasContent = typeof content === 'string' ? content.trim() !== '' : !!content;
+    return hasContent && !truncated;
+  } catch {
+    return false;
+  }
+}
+
 async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
 
-  const UPSTREAM = process.env.UPSTREAM_BASE_URL; // e.g. https://generativelanguage.googleapis.com/v1beta/openai
-  const KEY = process.env.UPSTREAM_API_KEY; // the REAL provider/gateway key — server-only
-  if (!UPSTREAM || !KEY) return json({ error: 'server_not_configured' }, 500);
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
+  if (!GROQ_KEY && !OPENROUTER_KEY) return json({ error: 'server_not_configured' }, 500);
 
   // Optional revocable app token. If APP_TOKEN is set, the extension must send a
   // matching Authorization: Bearer <token> (or x-app-token). It's still public
@@ -218,16 +216,6 @@ async function handler(req: Request): Promise<Response> {
     return json({ error: 'request_too_large' }, 413);
   }
 
-  // Optional model allowlist — keeps all traffic on cheap models.
-  const allowed = (process.env.ALLOWED_MODELS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const model = body.model || process.env.DEFAULT_MODEL || 'auto';
-  if (allowed.length && !allowed.includes(model)) {
-    return json({ error: 'model_not_allowed', model }, 400);
-  }
-
   const ip = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'anon';
   const clientId = (req.headers.get('x-client-id') || '').slice(0, 64);
   const verdict = await checkLimits(clientId, ip);
@@ -239,141 +227,55 @@ async function handler(req: Request): Promise<Response> {
     );
   }
 
-  const baseBody: Record<string, unknown> = {
-    model,
+  // Shared fields; model, and any provider-specific extras, are added per leg.
+  const sharedBody: Record<string, unknown> = {
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
-    // Floor of 1536: Anthropic's extended-thinking minimum budget is 1024
-    // tokens, and thinking tokens count against max_tokens, so anything at or
-    // below that floor 400s outright ("max_tokens must be greater than
-    // thinking.budget_tokens") whenever Manifest's fallback chain lands on a
-    // thinking-enabled Claude model (e.g. gemini-2.5-flash 429s -> claude-haiku-4-5).
-    max_tokens: Math.min(Math.max(clampNum(body.max_tokens, 1, 4096, 900), 1536), 3072),
-  };
-  const responseFormat = normalizeResponseFormat(body.response_format);
-  const upstreamBody: Record<string, unknown> = {
-    ...baseBody,
-    ...(responseFormat ? { response_format: responseFormat } : {}),
+    max_tokens: clampNum(body.max_tokens, 1, 4096, 900),
+    ...(body.response_format ? { response_format: body.response_format } : {}),
   };
 
-  const call = (b: Record<string, unknown>) =>
-    fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-      body: JSON.stringify(b),
-    });
+  let leg: LegResult | null = null;
+  let usedProvider = 'none';
 
-  // The body we actually sent, so each retry below keeps earlier adjustments.
-  let sent: Record<string, unknown> = upstreamBody;
-  let upstream: Response;
-  let text: string;
-  try {
-    upstream = await call(sent);
-    text = await upstream.text();
-  } catch (e: any) {
-    return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
-  }
-
-  // Upstream failures are otherwise invisible: the body is passed straight back
-  // to the extension, which shows only the human-readable message. Log the shape
-  // so the gateway's own error payload is diagnosable from `vercel logs`.
-  const logUpstreamFailure = (label: string) => {
-    if (upstream.status < 400) return;
-    console.error(
-      `[upstream ${label}] status=${upstream.status} max_tokens=${sent.max_tokens} body=${text.slice(0, 400)}`,
+  // 1) Groq: fast, non-reasoning models. Short timeout — at 250-500+ tok/s a
+  // real answer lands in low single-digit seconds, so anything slower than
+  // this is worth failing over rather than waiting on.
+  if (GROQ_KEY) {
+    const groqModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+    leg = await callLeg(
+      'https://api.groq.com/openai/v1/chat/completions',
+      GROQ_KEY,
+      { ...sharedBody, model: groqModel },
+      Number(process.env.GROQ_TIMEOUT_MS || '10000'),
     );
-  };
-  logUpstreamFailure('attempt-1');
+    if (leg) console.error(`[groq] status=${leg.status} usable=${isUsable(leg)} body=${leg.text.slice(0, 300)}`);
+    if (isUsable(leg)) usedProvider = 'groq';
+  }
 
-  // Safety net: Manifest injects Anthropic thinking on the OpenAI-compatible
-  // /chat/completions path (its "strip adaptive thinking for Claude Haiku" fix
-  // only covers native Anthropic Messages requests), and thinking tokens count
-  // against max_tokens. When the route's configured budget is larger than the
-  // 1536 floor above, Anthropic rejects the call pre-model with 0 tokens used,
-  // the whole chain is exhausted, and Manifest reports the PRIMARY's failure —
-  // typically the 429 that triggered the fallback in the first place, with no
-  // mention of budget_tokens. So retry on that 429 too, not just on a body that
-  // names the thinking error. The real fix is unsetting thinking on that route's
-  // Model params in Manifest; this only keeps a rate-limited primary survivable.
-  const thinkingRetryMaxTokens = clampNum(
-    process.env.THINKING_RETRY_MAX_TOKENS,
-    2048,
-    32_000,
-    16_384,
-  );
-  // Safety net: a reasoning-capable fallback (e.g. deepseek-v4-flash, nvidia
-  // nemotron — landed on after the primary 429s, or picked directly) can spend
-  // its whole max_tokens budget on hidden reasoning tokens and get cut off by
-  // finish_reason "length" before ever finishing the visible answer. Manifest
-  // reports that as a clean 200, so none of the checks above fire, and it shows
-  // up two ways downstream: choices[0].message.content === "" ("the provider
-  // returned an empty response"), or a half-written answer with no closing JSON
-  // brace ("No JSON object found in LLM response"). Both are the same
-  // truncation, so key off finish_reason directly rather than guessing from
-  // content shape, and give it the same headroom retry as the thinking-budget
-  // case above.
-  const wasTruncatedByLength = (): boolean => {
-    if (upstream.status !== 200) return false;
-    try {
-      const choice = JSON.parse(text)?.choices?.[0];
-      return choice?.finish_reason === 'length' || choice?.native_finish_reason === 'length';
-    } catch {
-      return false;
-    }
-  };
-  if (wasTruncatedByLength()) {
-    console.error(
-      `[upstream truncated] max_tokens=${sent.max_tokens} body=${text.slice(0, 400)}`,
+  // 2) OpenRouter free catalog, reasoning explicitly disabled, as fallback.
+  if (usedProvider === 'none' && OPENROUTER_KEY) {
+    const orModel = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3.5-lightning:free';
+    leg = await callLeg(
+      'https://openrouter.ai/api/v1/chat/completions',
+      OPENROUTER_KEY,
+      { ...sharedBody, model: orModel, reasoning: { enabled: false } },
+      Number(process.env.OPENROUTER_TIMEOUT_MS || '15000'),
+      { 'http-referer': 'https://rolereveal.app', 'x-title': 'RoleReveal' },
     );
+    if (leg) console.error(`[openrouter] status=${leg.status} usable=${isUsable(leg)} body=${leg.text.slice(0, 300)}`);
+    if (isUsable(leg)) usedProvider = 'openrouter';
   }
 
-  const worthRetryingWithRoomForThinking =
-    upstream.status === 429 ||
-    (upstream.status >= 400 && text.includes('thinking.budget_tokens')) ||
-    wasTruncatedByLength();
-  if (worthRetryingWithRoomForThinking && Number(sent.max_tokens) < thinkingRetryMaxTokens) {
-    sent = { ...sent, max_tokens: thinkingRetryMaxTokens };
-    try {
-      upstream = await call(sent);
-      text = await upstream.text();
-    } catch (e: any) {
-      return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
-    }
-    logUpstreamFailure('thinking-retry');
-  }
+  if (!leg) return json({ error: 'upstream_unreachable' }, 502);
 
-  // Safety net: if Manifest still exhausts its Anthropic route because a
-  // provider rejects structured output, retry once without response_format.
-  // The system prompt already requires JSON-only output and extractJson()
-  // tolerates the resulting plain-text-mode response.
-  const looksLikeManifestAnthropicSchemaBug = (): boolean => {
-    if (upstream.status !== 400 || !body.response_format) return false;
-    try {
-      const err = JSON.parse(text)?.error;
-      if (err?.code !== 'fallback_exhausted' || err?.source !== 'manifest') return false;
-      const fallbacks = Array.isArray(err?.attempted_fallbacks) ? err.attempted_fallbacks : [];
-      return err?.provider === 'anthropic' || fallbacks.some((f: any) => f?.provider === 'anthropic');
-    } catch {
-      return false;
-    }
-  };
-
-  if (looksLikeManifestAnthropicSchemaBug()) {
-    const { response_format: _dropped, ...withoutSchema } = sent;
-    sent = withoutSchema;
-    try {
-      upstream = await call(sent);
-      text = await upstream.text();
-    } catch (e: any) {
-      return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
-    }
-    logUpstreamFailure('schema-retry');
-  }
-
-  // Pass the OpenAI-shaped response straight through (extension reads choices[0]).
-  return new Response(text, {
-    status: upstream.status,
-    headers: { 'content-type': 'application/json', ...CORS },
+  // Pass the OpenAI-shaped response straight through (extension reads
+  // choices[0]) — including a final unusable result, so the extension's own
+  // error messages (empty response / bad JSON) still surface if both legs
+  // failed, rather than masking it with a generic 502.
+  return new Response(leg.text, {
+    status: leg.status,
+    headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': usedProvider },
   });
 }
 
