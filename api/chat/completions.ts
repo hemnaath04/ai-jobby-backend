@@ -295,9 +295,36 @@ export default async function handler(req: Request): Promise<Response> {
     32_000,
     16_384,
   );
+  // Safety net: a reasoning-capable fallback (e.g. deepseek-v4-flash, nvidia
+  // nemotron — landed on after the primary 429s, or picked directly) can spend
+  // its whole max_tokens budget on hidden reasoning tokens and get cut off by
+  // finish_reason "length" before ever finishing the visible answer. Manifest
+  // reports that as a clean 200, so none of the checks above fire, and it shows
+  // up two ways downstream: choices[0].message.content === "" ("the provider
+  // returned an empty response"), or a half-written answer with no closing JSON
+  // brace ("No JSON object found in LLM response"). Both are the same
+  // truncation, so key off finish_reason directly rather than guessing from
+  // content shape, and give it the same headroom retry as the thinking-budget
+  // case above.
+  const wasTruncatedByLength = (): boolean => {
+    if (upstream.status !== 200) return false;
+    try {
+      const choice = JSON.parse(text)?.choices?.[0];
+      return choice?.finish_reason === 'length' || choice?.native_finish_reason === 'length';
+    } catch {
+      return false;
+    }
+  };
+  if (wasTruncatedByLength()) {
+    console.error(
+      `[upstream truncated] max_tokens=${sent.max_tokens} body=${text.slice(0, 400)}`,
+    );
+  }
+
   const worthRetryingWithRoomForThinking =
     upstream.status === 429 ||
-    (upstream.status >= 400 && text.includes('thinking.budget_tokens'));
+    (upstream.status >= 400 && text.includes('thinking.budget_tokens')) ||
+    wasTruncatedByLength();
   if (worthRetryingWithRoomForThinking && Number(sent.max_tokens) < thinkingRetryMaxTokens) {
     sent = { ...sent, max_tokens: thinkingRetryMaxTokens };
     try {
